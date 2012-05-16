@@ -1,5 +1,4 @@
-/* Copyright (c) 2002,2007-2011, Code Aurora Forum. All rights reserved.
- * Copyright (C) 2011 Sony Ericsson Mobile Communications AB.
+/* Copyright (c) 2002,2007-2012, Code Aurora Forum. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -19,10 +18,19 @@
 #include <linux/sched.h>
 #include <linux/iommu.h>
 
+#define cpu_is_msm7x01()        0
+#define cpu_is_msm7x30()        0
+#define cpu_is_qsd8x50()        1
+#define cpu_is_msm8x60()        0
+#define cpu_is_msm8960()        0
+#define cpu_is_msm8930()        0
+#define cpu_is_apq8064()        0
+
 #include "kgsl.h"
 #include "kgsl_mmu.h"
 #include "kgsl_device.h"
 #include "kgsl_sharedmem.h"
+#include "adreno_postmortem.h"
 
 #define KGSL_MMU_ALIGN_SHIFT    13
 #define KGSL_MMU_ALIGN_MASK     (~((1 << KGSL_MMU_ALIGN_SHIFT) - 1))
@@ -34,6 +42,10 @@ static void pagetable_remove_sysfs_objects(struct kgsl_pagetable *pagetable);
 static int kgsl_cleanup_pt(struct kgsl_pagetable *pt)
 {
 	int i;
+	/* For IOMMU only unmap the global structures to global pt */
+	if ((KGSL_MMU_TYPE_IOMMU == kgsl_mmu_type) &&
+		(KGSL_MMU_GLOBAL_PT !=  pt->name))
+		return 0;
 	for (i = 0; i < KGSL_DEVICE_MAX; i++) {
 		struct kgsl_device *device = kgsl_driver.devp[i];
 		if (device)
@@ -56,6 +68,8 @@ static void kgsl_destroy_pagetable(struct kref *kref)
 
 	kgsl_cleanup_pt(pagetable);
 
+	if (pagetable->kgsl_pool)
+		gen_pool_destroy(pagetable->kgsl_pool);
 	if (pagetable->pool)
 		gen_pool_destroy(pagetable->pool);
 
@@ -147,9 +161,10 @@ sysfs_show_va_range(struct kobject *kobj,
 
 	pt = _get_pt_from_kobj(kobj);
 
-	if (pt)
+	if (pt) {
 		ret += snprintf(buf, PAGE_SIZE, "0x%x\n",
-			CONFIG_MSM_KGSL_PAGE_TABLE_SIZE);
+			kgsl_mmu_get_ptsize());
+	}
 
 	kgsl_put_pagetable(pt);
 	return ret;
@@ -267,6 +282,22 @@ err:
 	return ret;
 }
 
+unsigned int kgsl_mmu_get_ptsize(void)
+{
+	/*
+	 * For IOMMU, we could do up to 4G virtual range if we wanted to, but
+	 * it makes more sense to return a smaller range and leave the rest of
+	 * the virtual range for future improvements
+	 */
+
+	if (KGSL_MMU_TYPE_GPU == kgsl_mmu_type)
+		return CONFIG_MSM_KGSL_PAGE_TABLE_SIZE;
+	else if (KGSL_MMU_TYPE_IOMMU == kgsl_mmu_type)
+		return SZ_2G;
+	else
+		return 0;
+}
+
 unsigned int kgsl_mmu_get_current_ptbase(struct kgsl_device *device)
 {
 	struct kgsl_mmu *mmu = &device->mmu;
@@ -315,13 +346,14 @@ int kgsl_mmu_init(struct kgsl_device *device)
 
 	mmu->device = device;
 
-	if (KGSL_MMU_TYPE_NONE == kgsl_mmu_type ||
-	    KGSL_MMU_TYPE_IOMMU == kgsl_mmu_type) {
+	if (KGSL_MMU_TYPE_NONE == kgsl_mmu_type) {
 		dev_info(device->dev, "|%s| MMU type set for device is "
 			"NOMMU\n", __func__);
 		return 0;
 	} else if (KGSL_MMU_TYPE_GPU == kgsl_mmu_type)
 		mmu->mmu_ops = &gpummu_ops;
+	else if (KGSL_MMU_TYPE_IOMMU == kgsl_mmu_type)
+		mmu->mmu_ops = &iommu_ops;
 
 	return mmu->mmu_ops->mmu_init(device);
 }
@@ -365,6 +397,10 @@ static int kgsl_setup_pt(struct kgsl_pagetable *pt)
 	int i = 0;
 	int status = 0;
 
+	/* For IOMMU only map the global structures to global pt */
+	if ((KGSL_MMU_TYPE_IOMMU == kgsl_mmu_type) &&
+		(KGSL_MMU_GLOBAL_PT !=  pt->name))
+		return 0;
 	for (i = 0; i < KGSL_DEVICE_MAX; i++) {
 		struct kgsl_device *device = kgsl_driver.devp[i];
 		if (device) {
@@ -390,6 +426,7 @@ static struct kgsl_pagetable *kgsl_mmu_createpagetableobject(
 	int status = 0;
 	struct kgsl_pagetable *pagetable = NULL;
 	unsigned long flags;
+	unsigned int ptsize;
 
 	pagetable = kzalloc(sizeof(struct kgsl_pagetable), GFP_KERNEL);
 	if (pagetable == NULL) {
@@ -401,24 +438,48 @@ static struct kgsl_pagetable *kgsl_mmu_createpagetableobject(
 	kref_init(&pagetable->refcount);
 
 	spin_lock_init(&pagetable->lock);
+
+	ptsize = kgsl_mmu_get_ptsize();
+
 	pagetable->name = name;
-	pagetable->max_entries = KGSL_PAGETABLE_ENTRIES(
-					CONFIG_MSM_KGSL_PAGE_TABLE_SIZE);
+	pagetable->max_entries = KGSL_PAGETABLE_ENTRIES(ptsize);
+
+	/*
+	 * create a separate kgsl pool for IOMMU, global mappings can be mapped
+	 * just once from this pool of the defaultpagetable
+	 */
+	if ((KGSL_MMU_TYPE_IOMMU == kgsl_mmu_get_mmutype()) &&
+		(KGSL_MMU_GLOBAL_PT == name)) {
+		pagetable->kgsl_pool = gen_pool_create(PAGE_SHIFT, -1);
+		if (pagetable->kgsl_pool == NULL) {
+			KGSL_CORE_ERR("gen_pool_create(%d) failed\n",
+					PAGE_SHIFT);
+			goto err_alloc;
+		}
+		if (gen_pool_add(pagetable->kgsl_pool,
+			KGSL_IOMMU_GLOBAL_MEM_BASE,
+			KGSL_IOMMU_GLOBAL_MEM_SIZE, -1)) {
+			KGSL_CORE_ERR("gen_pool_add failed\n");
+			goto err_kgsl_pool;
+		}
+	}
 
 	pagetable->pool = gen_pool_create(PAGE_SHIFT, -1);
 	if (pagetable->pool == NULL) {
 		KGSL_CORE_ERR("gen_pool_create(%d) failed\n", PAGE_SHIFT);
-		goto err_alloc;
+		goto err_kgsl_pool;
 	}
 
 	if (gen_pool_add(pagetable->pool, KGSL_PAGETABLE_BASE,
-				CONFIG_MSM_KGSL_PAGE_TABLE_SIZE, -1)) {
+				ptsize, -1)) {
 		KGSL_CORE_ERR("gen_pool_add failed\n");
 		goto err_pool;
 	}
 
 	if (KGSL_MMU_TYPE_GPU == kgsl_mmu_type)
 		pagetable->pt_ops = &gpummu_pt_ops;
+	else if (KGSL_MMU_TYPE_IOMMU == kgsl_mmu_type)
+		pagetable->pt_ops = &iommu_pt_ops;
 
 	pagetable->priv = pagetable->pt_ops->mmu_create_pagetable();
 	if (!pagetable->priv)
@@ -441,6 +502,9 @@ err_mmu_create:
 	pagetable->pt_ops->mmu_destroy_pagetable(pagetable->priv);
 err_pool:
 	gen_pool_destroy(pagetable->pool);
+err_kgsl_pool:
+	if (pagetable->kgsl_pool)
+		gen_pool_destroy(pagetable->kgsl_pool);
 err_alloc:
 	kfree(pagetable);
 
@@ -455,6 +519,8 @@ struct kgsl_pagetable *kgsl_mmu_getpagetable(unsigned long name)
 		return (void *)(-1);
 
 #ifdef CONFIG_KGSL_PER_PROCESS_PAGE_TABLE
+	if (KGSL_MMU_TYPE_IOMMU == kgsl_mmu_type)
+		name = KGSL_MMU_GLOBAL_PT;
 #else
 		name = KGSL_MMU_GLOBAL_PT;
 #endif
@@ -529,22 +595,42 @@ kgsl_mmu_map(struct kgsl_pagetable *pagetable,
 	int ret;
 
 	if (kgsl_mmu_type == KGSL_MMU_TYPE_NONE) {
-		memdesc->gpuaddr = memdesc->physaddr;
-		return 0;
+		if (memdesc->sglen == 1) {
+			memdesc->gpuaddr = sg_phys(memdesc->sg);
+			return 0;
+		} else {
+			KGSL_CORE_ERR("Memory is not contigious "
+					"(sglen = %d)\n", memdesc->sglen);
+			return -EINVAL;
+		}
 	}
-	memdesc->gpuaddr = gen_pool_alloc_aligned(pagetable->pool,
-		memdesc->size, KGSL_MMU_ALIGN_SHIFT);
+
+	/* Allocate from kgsl pool if it exists for global mappings */
+	if (pagetable->kgsl_pool &&
+		(KGSL_MEMFLAGS_GLOBAL & memdesc->priv))
+		memdesc->gpuaddr = gen_pool_alloc_aligned(pagetable->kgsl_pool,
+			memdesc->size, KGSL_MMU_ALIGN_SHIFT);
+	else
+		memdesc->gpuaddr = gen_pool_alloc_aligned(pagetable->pool,
+			memdesc->size, KGSL_MMU_ALIGN_SHIFT);
 
 	if (memdesc->gpuaddr == 0) {
-		KGSL_CORE_ERR("gen_pool_alloc(%d) failed\n", memdesc->size);
+		KGSL_CORE_ERR("gen_pool_alloc(%d) failed from pool: %s\n",
+			memdesc->size,
+			((pagetable->kgsl_pool &&
+			(KGSL_MEMFLAGS_GLOBAL & memdesc->priv)) ?
+			"kgsl_pool" : "general_pool"));
 		KGSL_CORE_ERR(" [%d] allocated=%d, entries=%d\n",
 				pagetable->name, pagetable->stats.mapped,
 				pagetable->stats.entries);
 		return -ENOMEM;
 	}
 
-	spin_lock(&pagetable->lock);
+	if (KGSL_MMU_TYPE_IOMMU != kgsl_mmu_get_mmutype())
+		spin_lock(&pagetable->lock);
 	ret = pagetable->pt_ops->mmu_map(pagetable->priv, memdesc, protflags);
+	if (KGSL_MMU_TYPE_IOMMU == kgsl_mmu_get_mmutype())
+		spin_lock(&pagetable->lock);
 
 	if (ret)
 		goto err_free_gpuaddr;
@@ -580,18 +666,33 @@ kgsl_mmu_unmap(struct kgsl_pagetable *pagetable,
 		memdesc->gpuaddr = 0;
 		return 0;
 	}
-	spin_lock(&pagetable->lock);
+	if (KGSL_MMU_TYPE_IOMMU != kgsl_mmu_get_mmutype())
+		spin_lock(&pagetable->lock);
 	pagetable->pt_ops->mmu_unmap(pagetable->priv, memdesc);
+	if (KGSL_MMU_TYPE_IOMMU == kgsl_mmu_get_mmutype())
+		spin_lock(&pagetable->lock);
 	/* Remove the statistics */
 	pagetable->stats.entries--;
 	pagetable->stats.mapped -= memdesc->size;
 
 	spin_unlock(&pagetable->lock);
 
-	gen_pool_free(pagetable->pool,
+	if (pagetable->kgsl_pool &&
+		(KGSL_MEMFLAGS_GLOBAL & memdesc->priv))
+		gen_pool_free(pagetable->kgsl_pool,
+			memdesc->gpuaddr & KGSL_MMU_ALIGN_MASK,
+			memdesc->size);
+	else
+		gen_pool_free(pagetable->pool,
 			memdesc->gpuaddr & KGSL_MMU_ALIGN_MASK,
 			memdesc->size);
 
+	/*
+	 * Don't clear the gpuaddr on global mappings because they
+	 * may be in use by other pagetables
+	 */
+	if (!(memdesc->priv & KGSL_MEMFLAGS_GLOBAL))
+		memdesc->gpuaddr = 0;
 	return 0;
 }
 EXPORT_SYMBOL(kgsl_mmu_unmap);
@@ -611,6 +712,7 @@ int kgsl_mmu_map_global(struct kgsl_pagetable *pagetable,
 		return 0;
 
 	gpuaddr = memdesc->gpuaddr;
+	memdesc->priv |= KGSL_MEMFLAGS_GLOBAL;
 
 	result = kgsl_mmu_map(pagetable, memdesc, protflags);
 	if (result)
@@ -671,10 +773,10 @@ void kgsl_mmu_ptpool_destroy(void *ptpool)
 }
 EXPORT_SYMBOL(kgsl_mmu_ptpool_destroy);
 
-void *kgsl_mmu_ptpool_init(int ptsize, int entries)
+void *kgsl_mmu_ptpool_init(int entries)
 {
 	if (KGSL_MMU_TYPE_GPU == kgsl_mmu_type)
-		return kgsl_gpummu_ptpool_init(ptsize, entries);
+		return kgsl_gpummu_ptpool_init(entries);
 	else
 		return (void *)(-1);
 }
@@ -707,13 +809,18 @@ EXPORT_SYMBOL(kgsl_mmu_get_mmutype);
 
 void kgsl_mmu_set_mmutype(char *mmutype)
 {
-	kgsl_mmu_type = KGSL_MMU_TYPE_NONE;
-#ifdef CONFIG_MSM_KGSL_GPUMMU
-	kgsl_mmu_type = KGSL_MMU_TYPE_GPU;
-#elif defined(CONFIG_MSM_KGSL_IOMMU)
-#endif
+	/* Set the default MMU - GPU on <=8960 and nothing on >= 8064 */
+	kgsl_mmu_type =
+		cpu_is_apq8064() ? KGSL_MMU_TYPE_NONE : KGSL_MMU_TYPE_GPU;
+
+	/* Use the IOMMU if it is found */
+	if (iommu_found())
+		kgsl_mmu_type = KGSL_MMU_TYPE_IOMMU;
+
 	if (mmutype && !strncmp(mmutype, "gpummu", 6))
 		kgsl_mmu_type = KGSL_MMU_TYPE_GPU;
+	if (iommu_found() && mmutype && !strncmp(mmutype, "iommu", 5))
+		kgsl_mmu_type = KGSL_MMU_TYPE_IOMMU;
 	if (mmutype && !strncmp(mmutype, "nommu", 5))
 		kgsl_mmu_type = KGSL_MMU_TYPE_NONE;
 }
