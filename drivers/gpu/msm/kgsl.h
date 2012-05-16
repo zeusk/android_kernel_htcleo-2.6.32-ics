@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2011, Code Aurora Forum. All rights reserved.
+/* Copyright (c) 2008-2012, Code Aurora Forum. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -39,10 +39,6 @@
 
 #define KGSL_PAGETABLE_ENTRIES(_sz) (((_sz) >> PAGE_SHIFT) + \
 				     KGSL_PT_EXTRA_ENTRIES)
-
-#define KGSL_PAGETABLE_SIZE \
-ALIGN(KGSL_PAGETABLE_ENTRIES(CONFIG_MSM_KGSL_PAGE_TABLE_SIZE) * \
-KGSL_PAGETABLE_ENTRY_SIZE, PAGE_SIZE)
 
 #ifdef CONFIG_KGSL_PER_PROCESS_PAGE_TABLE
 #define KGSL_PAGETABLE_COUNT (CONFIG_MSM_KGSL_PAGE_TABLE_COUNT)
@@ -101,9 +97,6 @@ struct kgsl_driver {
 
 extern struct kgsl_driver kgsl_driver;
 
-#define KGSL_USER_MEMORY 1
-#define KGSL_MAPPED_MEMORY 2
-
 struct kgsl_pagetable;
 struct kgsl_memdesc_ops;
 
@@ -120,12 +113,26 @@ struct kgsl_memdesc {
 	struct kgsl_memdesc_ops *ops;
 };
 
+/* List of different memory entry types */
+
+#define KGSL_MEM_ENTRY_KERNEL 0
+#define KGSL_MEM_ENTRY_PMEM   1
+#define KGSL_MEM_ENTRY_ASHMEM 2
+#define KGSL_MEM_ENTRY_USER   3
+#define KGSL_MEM_ENTRY_ION    4
+#define KGSL_MEM_ENTRY_MAX    5
+
+/* List of flags */
+
+#define KGSL_MEM_ENTRY_FROZEN (1 << 0)
+
 struct kgsl_mem_entry {
 	struct kref refcount;
 	struct kgsl_memdesc memdesc;
 	int memtype;
-	struct file *file_ptr;
-	struct list_head list;
+	int flags;
+	void *priv_data;
+	struct rb_node node;
 	uint32_t free_timestamp;
 	/* back pointer to private structure under whose context this
 	* allocation is made */
@@ -139,8 +146,10 @@ struct kgsl_mem_entry {
 #endif
 
 void kgsl_mem_entry_destroy(struct kref *kref);
-uint8_t *kgsl_gpuaddr_to_vaddr(const struct kgsl_memdesc *memdesc,
-	unsigned int gpuaddr, unsigned int *size);
+
+struct kgsl_mem_entry *kgsl_get_mem_entry(unsigned int ptbase,
+		unsigned int gpuaddr, unsigned int size);
+
 struct kgsl_mem_entry *kgsl_sharedmem_find_region(
 	struct kgsl_process_private *private, unsigned int gpuaddr,
 	size_t size);
@@ -156,7 +165,6 @@ void kgsl_late_resume_driver(struct early_suspend *h);
 #ifdef CONFIG_MSM_KGSL_DRM
 extern int kgsl_drm_init(struct platform_device *dev);
 extern void kgsl_drm_exit(void);
-extern void kgsl_gpu_mem_flush(int op);
 #else
 static inline int kgsl_drm_init(struct platform_device *dev)
 {
@@ -169,13 +177,23 @@ static inline void kgsl_drm_exit(void)
 #endif
 
 static inline int kgsl_gpuaddr_in_memdesc(const struct kgsl_memdesc *memdesc,
-				unsigned int gpuaddr)
+				unsigned int gpuaddr, unsigned int size)
 {
-	if (gpuaddr >= memdesc->gpuaddr && (gpuaddr + sizeof(unsigned int)) <=
-		(memdesc->gpuaddr + memdesc->size)) {
+	if (gpuaddr >= memdesc->gpuaddr &&
+	    ((gpuaddr + size) <= (memdesc->gpuaddr + memdesc->size))) {
 		return 1;
 	}
 	return 0;
+}
+static inline uint8_t *kgsl_gpuaddr_to_vaddr(const struct kgsl_memdesc *memdesc,
+					     unsigned int gpuaddr)
+{
+	if (memdesc->hostptr == NULL || memdesc->gpuaddr == 0 ||
+		(gpuaddr < memdesc->gpuaddr ||
+		gpuaddr >= memdesc->gpuaddr + memdesc->size))
+		return NULL;
+
+	return memdesc->hostptr + (gpuaddr - memdesc->gpuaddr);
 }
 
 static inline int timestamp_cmp(unsigned int new, unsigned int old)
@@ -185,7 +203,7 @@ static inline int timestamp_cmp(unsigned int new, unsigned int old)
 	if (ts_diff == 0)
 		return 0;
 
-	return ((ts_diff > 0) || (ts_diff < -20000)) ? 1 : -1;
+	return ((ts_diff > 0) || (ts_diff < -25000)) ? 1 : -1;
 }
 
 static inline void

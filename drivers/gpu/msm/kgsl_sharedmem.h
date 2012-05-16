@@ -1,5 +1,4 @@
-/* Copyright (c) 2002,2007-2011, Code Aurora Forum. All rights reserved.
- * Copyright (C) 2011 Sony Ericsson Mobile Communications AB.
+/* Copyright (c) 2002,2007-2012, Code Aurora Forum. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -16,11 +15,10 @@
 
 #include <linux/slab.h>
 #include <linux/dma-mapping.h>
-
-/*
- * Convert a page to a physical address
- */
-#define phys_to_page(phys)	(pfn_to_page(__phys_to_pfn(phys)))
+#include <linux/vmalloc.h>
+#include "kgsl_mmu.h"
+#include <linux/slab.h>
+#include <linux/kmemleak.h>
 
 struct kgsl_device;
 struct kgsl_process_private;
@@ -31,6 +29,8 @@ struct kgsl_process_private;
 
 /** Set if the memdesc describes cached memory */
 #define KGSL_MEMFLAGS_CACHED    0x00000001
+/** Set if the memdesc is mapped into all pagetables */
+#define KGSL_MEMFLAGS_GLOBAL    0x00000002
 
 struct kgsl_memdesc_ops {
 	int (*vmflags)(struct kgsl_memdesc *);
@@ -80,19 +80,33 @@ void kgsl_process_uninit_sysfs(struct kgsl_process_private *private);
 int kgsl_sharedmem_init_sysfs(void);
 void kgsl_sharedmem_uninit_sysfs(void);
 
+static inline unsigned int kgsl_get_sg_pa(struct scatterlist *sg)
+{
+	/*
+	 * Try sg_dma_address first to support ion carveout
+	 * regions which do not work with sg_phys().
+	 */
+	unsigned int pa = sg_dma_address(sg);
+	if (pa == 0)
+		pa = sg_phys(sg);
+	return pa;
+}
+
 static inline int
 memdesc_sg_phys(struct kgsl_memdesc *memdesc,
 		unsigned int physaddr, unsigned int size)
 {
-	struct page *page = phys_to_page(physaddr);
-
-	memdesc->sg = kmalloc(sizeof(struct scatterlist) * 1, GFP_KERNEL);
+	memdesc->sg = vmalloc(sizeof(struct scatterlist) * 1);
 	if (memdesc->sg == NULL)
 		return -ENOMEM;
 
+	kmemleak_not_leak(memdesc->sg);
+
 	memdesc->sglen = 1;
 	sg_init_table(memdesc->sg, 1);
-	sg_set_page(&memdesc->sg[0], page, size, 0);
+	memdesc->sg[0].length = size;
+	memdesc->sg[0].offset = 0;
+	memdesc->sg[0].dma_address = physaddr;
 	return 0;
 }
 
@@ -100,11 +114,9 @@ static inline int
 kgsl_allocate(struct kgsl_memdesc *memdesc,
 		struct kgsl_pagetable *pagetable, size_t size)
 {
-#ifdef CONFIG_MSM_KGSL_MMU
+	if (kgsl_mmu_get_mmutype() == KGSL_MMU_TYPE_NONE)
+		return kgsl_sharedmem_ebimem(memdesc, pagetable, size);
 	return kgsl_sharedmem_vmalloc(memdesc, pagetable, size);
-#else
-	return kgsl_sharedmem_ebimem(memdesc, pagetable, size);
-#endif
 }
 
 static inline int
@@ -112,21 +124,18 @@ kgsl_allocate_user(struct kgsl_memdesc *memdesc,
 		struct kgsl_pagetable *pagetable,
 		size_t size, unsigned int flags)
 {
-#ifdef CONFIG_MSM_KGSL_MMU
+	if (kgsl_mmu_get_mmutype() == KGSL_MMU_TYPE_NONE)
+		return kgsl_sharedmem_ebimem_user(memdesc, pagetable, size,
+						  flags);
 	return kgsl_sharedmem_vmalloc_user(memdesc, pagetable, size, flags);
-#else
-	return kgsl_sharedmem_ebimem_user(memdesc, pagetable, size, flags);
-#endif
 }
 
 static inline int
 kgsl_allocate_contiguous(struct kgsl_memdesc *memdesc, size_t size)
 {
 	int ret  = kgsl_sharedmem_alloc_coherent(memdesc, size);
-#ifndef CONFIG_MSM_KGSL_MMU
-	if (!ret)
+	if (!ret && (kgsl_mmu_get_mmutype() == KGSL_MMU_TYPE_NONE))
 		memdesc->gpuaddr = memdesc->physaddr;
-#endif
 	return ret;
 }
 

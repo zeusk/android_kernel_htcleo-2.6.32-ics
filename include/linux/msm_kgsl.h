@@ -35,13 +35,14 @@
 #define _MSM_KGSL_H
 
 #define KGSL_VERSION_MAJOR        3
-#define KGSL_VERSION_MINOR        8
+#define KGSL_VERSION_MINOR        9
 
 /*context flags */
 #define KGSL_CONTEXT_SAVE_GMEM	1
 #define KGSL_CONTEXT_NO_GMEM_ALLOC	2
 #define KGSL_CONTEXT_SUBMIT_IB_LIST	4
 #define KGSL_CONTEXT_CTX_SWITCH	8
+#define KGSL_CONTEXT_PREAMBLE	16
 
 /* Memory allocayion flags */
 #define KGSL_MEMFLAGS_GPUREADONLY	0x01000000
@@ -58,10 +59,28 @@
 #define KGSL_FLAGS_RESERVED2   0x00000080
 #define KGSL_FLAGS_SOFT_RESET  0x00000100
 
+/* Clock flags to show which clocks should be controled by a given platform */
+#define KGSL_CLK_SRC	0x00000001
+#define KGSL_CLK_CORE	0x00000002
+#define KGSL_CLK_IFACE	0x00000004
+#define KGSL_CLK_MEM	0x00000008
+#define KGSL_CLK_MEM_IFACE 0x00000010
+#define KGSL_CLK_AXI	0x00000020
+
+/*
+ * Reset status values for context
+ */
+enum kgsl_ctx_reset_stat {
+	KGSL_CTX_STAT_NO_ERROR				= 0x00000000,
+	KGSL_CTX_STAT_GUILTY_CONTEXT_RESET_EXT		= 0x00000001,
+	KGSL_CTX_STAT_INNOCENT_CONTEXT_RESET_EXT	= 0x00000002,
+	KGSL_CTX_STAT_UNKNOWN_CONTEXT_RESET_EXT		= 0x00000003
+};
+
 #define KGSL_MAX_PWRLEVELS 5
 
 #define KGSL_CONVERT_TO_MBPS(val) \
-  (val*1000*1000U)
+	(val*1000*1000U)
 
 /* device id */
 enum kgsl_deviceid {
@@ -74,7 +93,9 @@ enum kgsl_deviceid {
 enum kgsl_user_mem_type {
 	KGSL_USER_MEM_TYPE_PMEM		= 0x00000000,
 	KGSL_USER_MEM_TYPE_ASHMEM	= 0x00000001,
-	KGSL_USER_MEM_TYPE_ADDR		= 0x00000002
+	KGSL_USER_MEM_TYPE_ADDR		= 0x00000002,
+	KGSL_USER_MEM_TYPE_ION		= 0x00000003,
+	KGSL_USER_MEM_TYPE_MAX		= 0x00000004,
 };
 
 struct kgsl_devinfo {
@@ -132,6 +153,7 @@ enum kgsl_property_type {
 	KGSL_PROP_MMU_ENABLE 	  = 0x00000006,
 	KGSL_PROP_INTERRUPT_WAITS = 0x00000007,
 	KGSL_PROP_VERSION         = 0x00000008,
+	KGSL_PROP_GPU_RESET_STAT  = 0x00000009
 };
 
 struct kgsl_shadowprop {
@@ -143,6 +165,7 @@ struct kgsl_shadowprop {
 struct kgsl_pwrlevel {
 	unsigned int gpu_freq;
 	unsigned int bus_freq;
+	unsigned int io_fraction;
 };
 
 struct kgsl_version {
@@ -161,32 +184,26 @@ struct kgsl_version {
 #define KGSL_2D1_REG_MEMORY	"kgsl_2d1_reg_memory"
 #define KGSL_2D1_IRQ		"kgsl_2d1_irq"
 
-struct kgsl_grp_clk_name {
-	const char *clk;
-	const char *pclk;
+struct kgsl_device_iommu_data {
+	const char **iommu_ctx_names;
+	int iommu_ctx_count;
+	unsigned int physstart;
+	unsigned int physend;
 };
 
-struct kgsl_device_pwr_data {
+struct kgsl_device_platform_data {
 	struct kgsl_pwrlevel pwrlevel[KGSL_MAX_PWRLEVELS];
 	int init_level;
 	int num_levels;
 	int (*set_grp_async)(void);
 	unsigned int idle_timeout;
 	unsigned int nap_allowed;
-};
-
-struct kgsl_clk_data {
-	struct kgsl_grp_clk_name name;
+	unsigned int clk_map;
+	unsigned int idle_needed;
 	struct msm_bus_scale_pdata *bus_scale_table;
-};
-
-struct kgsl_device_platform_data {
-	struct kgsl_device_pwr_data pwr_data;
-	struct kgsl_clk_data clk;
-	/* imem_clk_name is for 3d only, not used in 2d devices */
-	struct kgsl_grp_clk_name imem_clk_name;
-	const char *iommu_user_ctx_name;
-	const char *iommu_priv_ctx_name;
+	struct kgsl_device_iommu_data *iommu_data;
+	int iommu_count;
+	struct msm_dcvs_core_info *core_info;
 };
 
 #endif
@@ -221,19 +238,8 @@ struct kgsl_device_getproperty {
 #define IOCTL_KGSL_DEVICE_GETPROPERTY \
 	_IOWR(KGSL_IOC_TYPE, 0x2, struct kgsl_device_getproperty)
 
-
-/* read a GPU register.
-   offsetwords it the 32 bit word offset from the beginning of the
-   GPU register space.
+/* IOCTL_KGSL_DEVICE_READ (0x3) - removed 03/2012
  */
-struct kgsl_device_regread {
-	unsigned int offsetwords;
-	unsigned int value; /* output param */
-};
-
-#define IOCTL_KGSL_DEVICE_REGREAD \
-	_IOWR(KGSL_IOC_TYPE, 0x3, struct kgsl_device_regread)
-
 
 /* block until the GPU has executed past a given timestamp
  * timeout is in milliseconds.
@@ -459,9 +465,9 @@ struct kgsl_cff_syncmem {
 	_IOW(KGSL_IOC_TYPE, 0x30, struct kgsl_cff_syncmem)
 
 /*
-* A timestamp event allows the user space to register an action following an
-* expired timestamp.
-*/
+ * A timestamp event allows the user space to register an action following an
+ * expired timestamp.
+ */
 
 struct kgsl_timestamp_event {
 	int type;                /* Type of event (see list below) */
@@ -481,6 +487,14 @@ struct kgsl_timestamp_event {
 struct kgsl_timestamp_event_genlock {
 	int handle; /* Handle of the genlock lock to release */
 };
+
+/*
+ * Set a property within the kernel.  Uses the same structure as
+ * IOCTL_KGSL_GETPROPERTY
+ */
+
+#define IOCTL_KGSL_SETPROPERTY \
+	_IOW(KGSL_IOC_TYPE, 0x32, struct kgsl_device_getproperty)
 
 #ifdef __KERNEL__
 #ifdef CONFIG_MSM_KGSL_DRM
