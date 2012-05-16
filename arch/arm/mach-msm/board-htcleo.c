@@ -61,9 +61,7 @@
 #include <mach/htc_headset_mgr.h>
 #include <mach/htc_headset_gpio.h>
 
-#ifdef CONFIG_MSM_KGSL
 #include <linux/msm_kgsl.h>
-#endif
 
 #include <mach/board-htcleo-microp.h>
 
@@ -747,8 +745,9 @@ static struct platform_device qsd_device_spi = {
 };
 
 ///////////////////////////////////////////////////////////////////////
-// KGSL (HW3D support)#include <linux/android_pmem.h>
+// KGSL-3d0 v3.9 (HW3D support)
 ///////////////////////////////////////////////////////////////////////
+
 static int htcleo_kgsl_power_rail_mode(int follow_clk)
 {
 	int mode = follow_clk ? 0 : 1;
@@ -765,7 +764,6 @@ static int htcleo_kgsl_power(bool on)
     	return msm_proc_comm(cmd, &rail_id, 0);
 }
 
-/* start kgsl-3d0 */
 static struct resource kgsl_3d0_resources[] = {
 	{
 		.name  = KGSL_3D0_REG_MEMORY,
@@ -782,26 +780,17 @@ static struct resource kgsl_3d0_resources[] = {
 };
 
 static struct kgsl_device_platform_data kgsl_3d0_pdata = {
-	.pwr_data = {
-		.pwrlevel = {
-			{
-				.gpu_freq = 0,
-				.bus_freq = 128000000,
-			},
-		},
-		.init_level = 0,
-		.num_levels = 1,
-		.set_grp_async = NULL,
-		.idle_timeout = HZ/5,
-	},
-	.clk = {
-		.name = {
-			.clk = "grp_clk",
+	.pwrlevel = {
+		{
+			.gpu_freq = 0,
+			.bus_freq = 128000000,
 		},
 	},
-	.imem_clk_name = {
-		.clk = "imem_clk",
-	},
+	.init_level = 0,
+	.num_levels = 1,
+	.set_grp_async = NULL,
+	.idle_timeout = HZ/5,
+	.clk_map = KGSL_CLK_CORE | KGSL_CLK_MEM,
 };
 
 struct platform_device msm_kgsl_3d0 = {
@@ -813,7 +802,7 @@ struct platform_device msm_kgsl_3d0 = {
 		.platform_data = &kgsl_3d0_pdata,
 	},
 };
-/* end kgsl-3d0 */
+
 ///////////////////////////////////////////////////////////////////////
 // Memory
 ///////////////////////////////////////////////////////////////////////
@@ -985,11 +974,7 @@ static struct platform_device *devices[] __initdata =
 	&msm_device_i2c,
 	&ds2746_battery_pdev,
 	&htc_battery_pdev,
-#ifdef CONFIG_MSM_KGSL
 	&msm_kgsl_3d0,
-#else
-	&msm_kgsl_device,
-#endif
 	&msm_camera_sensor_s5k3e2fx,
 	&htcleo_flashlight_device,
 	&qsd_device_spi,

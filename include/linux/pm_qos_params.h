@@ -8,6 +8,7 @@
 #define __PM_QOS_PARAMS_H__
 
 #include <linux/list.h>
+#include <linux/plist.h>
 #include <linux/notifier.h>
 #include <linux/miscdevice.h>
 
@@ -45,6 +46,11 @@ struct pm_qos_object {
 		int (*update_fn)(struct pm_qos_object *, char *, s32, void **);
 		int (*remove_fn)(struct pm_qos_object *, char *, s32, void **);
 	} *plugin;
+};
+
+struct pm_qos_request_list {
+	struct plist_node list;
+	int pm_qos_class;
 };
 
 int pm_qos_register_plugin(int pm_qos_class, struct pm_qos_plugin *plugin);
